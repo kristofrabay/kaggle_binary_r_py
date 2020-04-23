@@ -1,0 +1,589 @@
+---
+title: "Data Science 3: Kaggle Competition"
+author: "Kristof Rabay"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+---
+
+```{r, include = F}
+library(data.table)
+library(caret)
+library(dataPreparation)
+library(skimr)
+library(pROC)
+library(tidyverse)
+library(keras)
+library(h2o)
+library(xgboost)
+
+options(digits = 6)
+options(scipen = 999)
+theme_set(theme_bw())
+```
+
+
+# Goal of exercise
+
+This is a Kaggle competition focusing on predicting of an online article whether or not it will be 'popular'. An article is popular if it reaches a certain number of shares. The number of shares is unknown, but the binary feature (which is 1 is the article was popular and 0 if it was not) is already created, so everything is given to predict a binary y on numerous X features.
+
+# Note on submitted files
+
+Please note that after trying to install `lightGBM` on R in Windows and failing every time, I turned to Python and created an ensemble model there from an `xgBoost`, a `lightGBM`, a simple GBM and a random forest and applied a `votingclassifier()` on them. That model scored the best overall amongst all my models (R and Python including). You can find the Jupyter Notebook in HTML extract in my submitted files as well.
+
+## Reading in the Data
+
+```{r}
+train <- data.table(read.csv("train.csv"))
+test <- data.table(read.csv("test.csv"))
+```
+
+## Data Exploration
+
+```{r}
+skim_with(numeric = list(hist = NULL)) # no histograms
+```
+
+
+```{r}
+skim(train)
+# skim(test)
+```
+
+
+There are a lot of features to use, no NAs are present, which is nice, but lots of variables seem to have a maximum value of 1 and minimum value of 0, so unless they represent some sort of probability, they will need to be converted to factors.
+
+First thing's first, let's find the Y feature in the train set:
+
+```{r}
+setdiff(names(train), names(test))
+```
+
+I'll be trying to predict whether or not an article is popular.
+
+### Setting aside the article_ID, separating Xs from the Y to scale them. I do not intend to scale features that will be factorized, and I looked at the data, so I know variables that have `data_channel` or `is_` in their names, are the factor features.
+
+```{r}
+article_ID <- "article_id"
+factors <- names(train)[names(train) %like% "data_channel" | names(train) %like% "is_"]
+X_cols <- names(train)[!names(train) %in% c(article_ID, "is_popular", factors)]
+Y_col <- "is_popular"
+```
+
+Scaling the X features: the test features will need to be scaled with the mean and sd of the train dataset. I'm not scalig the binary variables, only the numeric (integer or double) features
+
+```{r, warning = F, message = F}
+scales <- build_scales(dataSet = train, cols = X_cols, verbose = F)
+fastScale(dataSet = train, scales = scales, verbose = F)
+fastScale(dataSet = test, scales = scales, verbose = F) # 'scales' has means and sds from train
+```
+
+Let's check if there are some features that can be dropped  due to multicollinearity.
+
+### Checking the correlation matrix
+
+```{r, fig.height = 16, fig.width = 16, fig.align='center'}
+
+to_check_correlation <- names(train)[!names(train) %in% "article_id"] # everything that is not the identifier
+
+corrplot::corrplot(cor(train[, ..to_check_correlation]), 
+                   method = "number",
+                   tl.cex = 0.55, 
+                   tl.col = "black",
+                   diag = T, 
+                   cl.cex = 0.75, 
+                   number.cex = 0.5)
+
+```
+
+There's perfect correlation between:
+
+- n_unique_tokens & n_non_stop_words
+- n_unique_tokens & n_non_stop_unique_tokens
+- n_non_stop_words & n_non_stop_unique_tokens
+
+There's > 0.9 correlation between:
+
+- kw_max_min & kw_avg_min
+
+
+Decisions:
+
+1. Drop n_non_stop_words AND n_non_stop_unique_tokens
+2. Drop kw_avg_min
+
+```{r}
+to_drop <- c("n_non_stop_words", "n_non_stop_unique_tokens", "kw_avg_min")
+train[, (to_drop) := NULL]
+test[, (to_drop) := NULL] # not necessary tho
+```
+
+
+### Features to turn to binary variables
+
+- data_channel features (data_channel_is_bus, data_channel_is_entertainment, etc...)
+- is_popular in the train set
+- is_weekend
+- weekday_is features (weekday_is_friday, weekday_is_monday, etc...)
+
+```{r}
+# note: for keras I will reimport train and test, skip factorizaton step to have only numerics as input
+
+to_binary <- names(train)[names(train) %like% "data_channel" | names(train) %like% "is_"]
+train[, (to_binary):= lapply(.SD, as.factor), .SDcols = to_binary]
+ 
+to_binary_test <- names(test)[names(test) %like% "data_channel" | names(test) %like% "is_"]
+test[, (to_binary_test):= lapply(.SD, as.factor), .SDcols = to_binary_test]
+```
+
+
+## Modeling
+
+Since I only have the train dataset labeled, I will carve a validation set out of my train set and use it as my own test set. I will apply CV on the training, score on my test, and make predictions on the actual test to submit to Kaggle.
+
+```{r}
+# train on train with CV
+# score on validation as my own test data
+# live data: kaggle <- score their what was best on my validation data
+set.seed(20202020)
+train_index <- createDataPartition(train$is_popular, times = 1, p = 0.8, list = F)
+valid <- train[-train_index, ]
+train <- train[train_index, ]
+
+```
+
+Let's see how many samples I'll train, validate and test on.
+
+```{r}
+for (set in c("train", "valid", "test")) {
+  print(paste0(nrow(get(set)),  ' samples in my ', set, ' object'))
+}
+
+```
+
+To make my document more structured, I'll start by showing my `h2o` modeling methods and results.
+
+### H2O
+
+In `h2o` I trained a GBM, an RF, a GBM and a Net model, stacked the 2 best performing ones (GBM and RF) together and made predictions on the Kaggle test set on the stacked model and on the simple GBM model.
+
+First, I created my `h2o` objects, and separated y from X.
+
+```{r, message = F, warning = F}
+
+h2o.init()
+h2o.no_progress() # no progress bar
+
+h2o_train <- as.h2o(train)
+h2o_valid <- as.h2o(valid)
+h2o_test <- as.h2o(test)
+
+
+y <- "is_popular"
+X <- setdiff(names(h2o_train), c(y, "article_id"))
+```
+
+1. A simple GBM: 
+
+In the submission I only feed it the best values I've found during my grid search. This greatly reduces the knitting time.
+
+
+This is what 'method' I used to train my models:
+
+- Gave all parameters 3 equidistant values
+- Looked at the best model's parameters, and moved my grid values to its direction (increase or decrease parameter)
+- This way once I overshot the best values, once undershot them, but finally I was able to narrow them 
+- This is procedure took about 1 hour / model, so considering the R and Python models I've run I spent around 10-12 hours on the assignment
+
+
+```{r}
+gbm_grid <- h2o.grid(x = X, 
+                     y = y,
+                     training_frame = h2o_train,
+                     algorithm = "gbm",
+                     ntrees = 500,
+                     hyper_params = list(learn_rate = 0.01,
+                                         max_depth = c(9), # 9
+                                         min_rows = c(10), # 10
+                                         sample_rate = c(1/3), # 1/3
+                                         col_sample_rate = c(0.5)), # 0.5
+                     seed = 20202020,
+                     nfolds = 5, 
+                     keep_cross_validation_predictions = TRUE)
+
+h2o.getGrid(grid_id = gbm_grid@grid_id, sort_by = "auc", decreasing = TRUE)@summary_table # 71.29
+h2o.performance(h2o.getModel(h2o.getGrid(gbm_grid@grid_id)@model_ids[[1]]), newdata = h2o_valid)@metrics$AUC # 72.825
+```
+
+
+My best GBM scored a 72.85 AUC on the validation set.
+
+What best parameters I ended up with after the grid search:
+
+- Col sample rate: used 50% of the features for every trees' each splits
+- Sample rate: 1/3 of rows used to further generalize the model and avoid overfit
+- Minimum rows in leaf: if a split would result in a node with less than 10 observations, don't do the split.
+- Maximum depth: After 9 splits the GBM can stop building a single tree
+- Learning rate: ended up using 1%, but experimented with 0.5 and 2 to see if it should be increased or decreased
+
+2. A random forest model
+
+```{r}
+rf_grid <- h2o.grid(x = X, 
+                    y = y, 
+                    training_frame = h2o_train, 
+                    algorithm = "randomForest", 
+                    nfolds = 5,
+                    seed = 20202020,
+                    hyper_params = list(ntrees = 500,
+                                        max_depth = c(19), # 19
+                                        mtries = c(9), # 9
+                                        sample_rate = c(0.75), # 0.75
+                                        min_rows = c(4)), # 4
+                    keep_cross_validation_predictions = TRUE)
+
+h2o.getGrid(grid_id = rf_grid@grid_id, sort_by = "auc", decreasing = TRUE)@summary_table # 71.02
+h2o.performance(h2o.getModel(h2o.getGrid(rf_grid@grid_id)@model_ids[[1]]), newdata = h2o_valid)@metrics$AUC # 72.24
+```
+
+My best RF scored a 72.24 AUC on the validation set. GBM is a tiny bit better than this.
+
+What best parameters I ended up with after the grid search:
+
+- Maximum depth: This was surprising to me, but allowing even 19 splits did not cause overfit on the validation set. This probably is due to the huge amount of features to work with
+- Feautures used for a split: I allowed the RF model to use up to 9 variables to decide based on which one it wants to split
+- Sample rate: to further generalize the model, I had it take only 3/4th of the rows for building a tree
+- Minimum rows in leaf: This was surprising to me as well, but allowing such a small number (4) to be the minimum requirement for a final node did not cause overfit. 
+
+3. A logistic regression with regularization
+
+```{r}
+glm_grid <- h2o.grid(x = X, 
+                     y = y, 
+                     training_frame = h2o_train, 
+                     algorithm = "glm", 
+                     hyper_params = list(alpha = 0.5, # seq(0, 1, 0.1)
+                                         lambda = 0.001), # seq(0, 0.01, 0.001)
+                     nfolds = 5,
+                     seed = 20202020,
+                     family = 'binomial',
+                     keep_cross_validation_predictions = TRUE)
+
+h2o.getGrid(grid_id = glm_grid@grid_id, sort_by = "auc", decreasing = TRUE)@summary_table # 68.80
+h2o.performance(h2o.getModel(h2o.getGrid(glm_grid@grid_id)@model_ids[[1]]), newdata = h2o_valid)@metrics$AUC # 69.79
+```
+
+My best GLM scored a 69.79 AUC on the validation set. Significantly worse than the GBM or RF scores.
+
+What best parameters I ended up with after the grid search:
+
+- Alpha is 0.5, meaning it is an elastic net logistic regression that assigns equal weights to lasso and ridge regularization
+- Lambda is 0.001, meaning the actual penalty coefficient is 0.001, which makes sense, as all the features are scales and therefore are small (close to 0)
+
+4. A simple neural net from `h2o` (I train a Keras net later)
+
+```{r}
+net_grid <- h2o.grid(x = X, 
+                     y = y, 
+                     training_frame = h2o_train, 
+                     algorithm = 'deeplearning',
+                     hyper_params = list(activation = c("Rectifier"),
+                                         hidden = list(c(64, 128, 256, 512)), #, c(128, 128, 256, 512)
+                                         input_dropout_ratio = c(0.1), #, 0.15
+                                         l2 = c(0)), # l1 and l2 didnt seem to help substantially (marginally)
+                     nfolds = 5,
+                     seed = 20202020,
+                     keep_cross_validation_predictions = TRUE)
+
+h2o.getGrid(grid_id = net_grid@grid_id, sort_by = "auc", decreasing = TRUE)@summary_table # 69.16
+h2o.performance(h2o.getModel(h2o.getGrid(net_grid@grid_id)@model_ids[[1]]), newdata = h2o_valid)@metrics$AUC # 71.24
+```
+
+The best net scored a 71.24 AUC on the validation set.
+
+What best parameters I ended up with after the grid search:
+
+- Getting the best parameters for a net is impossible for a human I think, but after some tries I have found:
+- 4 hiddel layers with
+- 64, 128, 256 and 512 hidden neurons respectively (I wanted the net to extract more and more patterns from inputs)
+- using a 10% dropout to somewhat avoid overfit and
+- use no further regularization because it did not improve validation AUC
+
+Later I'll present my Keras solution, where building a net is much more straightforward.
+
+5. Stacking the best ones
+
+After numerous attempts I realized that stacking all the models results in worse AUC on the validation set, than stacking only the best learners.
+
+After trying multiple `metalearner_algorithms` I ended up using a simple net with 3 hidden layers, each consisting of 64 neurons, used 30 epochs and 100 batch size. This setting beat the `AUTO`, `GLM` and `GBM` meta learners.
+
+```{r}
+ensemble_model <- h2o.stackedEnsemble(X, y,
+                                      training_frame = h2o_train,
+                                      base_models = list(h2o.getModel(h2o.getGrid(rf_grid@grid_id)@model_ids[[1]]), 
+                                                         h2o.getModel(h2o.getGrid(gbm_grid@grid_id)@model_ids[[1]])),
+                                                         #h2o.getModel(h2o.getGrid(net_grid@grid_id)@model_ids[[1]]),
+                                                         #h2o.getModel(h2o.getGrid(glm_grid@grid_id)@model_ids[[1]])),
+                                      keep_levelone_frame = TRUE,
+                                      metalearner_algorithm = "deeplearning",
+                                      metalearner_nfolds = 5,
+                                      metalearner_params = list(epochs = 30, 
+                                                                hidden = c(64, 64, 64),
+                                                                train_samples_per_iteration = 100),
+                                      seed = 20202020)
+
+
+h2o.auc(h2o.performance(ensemble_model, newdata = h2o_valid)) # 72.74 <- used models' valid AUCs were around 72
+```
+
+The stack model scored 72.74 AUC on the validation set.
+
+- GBM was 72.85
+- RF was 72.24
+- their stacked model with a net meta learner: 72.74
+
+As mentioned I used a deep learning meta learner, and I actually experimented with its structure and this 30 epoch, 3 hidden layer, 100 batch size net was doing better than other default ones.
+
+6. AutoML (not used, just shown)
+
+I've also experimented with AutoML to see what algos it chooses to work with, but my stack and GBM models with fine tuning beat the simple AutoML model, so I didn't end up using it.
+
+```{r, eval = F, include = T}
+automl_model <- h2o.automl(X, 
+                           y,
+                           training_frame = h2o_train,
+                           max_models = 5,
+                           max_runtime_secs = 5*10*60,
+                           nfolds = 5,
+                           stopping_metric = 'AUC',
+                           seed = 20202020,
+                           #keep_cross_validation_predictions = T,
+                           balance_classes = T)
+
+
+automl_model@leaderboard
+
+h2o.auc(h2o.performance(h2o.getModel(automl_model@leaderboard[1,1]), newdata = h2o_valid)) # does not beat 72.74 on valid
+
+```
+
+To make a note, if I could've used `xgBoost` with `h2o` I suppose I must have been able to beat my own models with it, because as we'll find out, `xgBoost` almost outperformed my GBM (which is why I turn to Python later)
+
+
+#### Making predictions on the test set to submit
+
+Here I'm just showing how I managed to create the prediction CSVs with the right format to submit. As mentioned I predicted with the simple GBM and the stack model.
+
+```{r, include = T, eval = F}
+from_ENS <- h2o.predict(ensemble_model, newdata = h2o_test)
+from_ENS <- as.data.frame(from_ENS[,3])
+article_ID <- as.data.frame(h2o_test$article_id)
+from_ENS <- data.frame('article_id' = article_ID,
+                       'score' = from_ENS)
+names(from_ENS) <- c("article_id", "score")
+write.csv(from_ENS, "KrRab_h2o_ensemble.csv", row.names = F, quote = F)
+```
+
+
+```{r, include = T, eval = F}
+from_GBM <- h2o.predict(h2o.getModel(h2o.getGrid(gbm_grid@grid_id)@model_ids[[1]]), newdata = h2o_test)
+from_GBM <- as.data.frame(from_GBM[,3])
+article_ID <- as.data.frame(h2o_test$article_id)
+from_GBM <- data.frame('article_id' = article_ID,
+                       'score' = from_GBM)
+names(from_GBM) <- c("article_id", "score")
+write.csv(from_GBM, "KrRab_h2o_GBM.csv", row.names = F, quote = F)
+```
+
+I've just shown what I'd done with `h2o`, now let's turn to the other models I trained in R.
+
+
+### XGB
+
+I've decided to run an `xgBoost` to see if it can beat a simple GBM. (The same reason I wanted to train a `lightGBM` but could only do so in Python)
+
+```{r, warning = F, message = F}
+train$is_popular <- ifelse(train$is_popular == 1, 'popular', 'not_popular')
+valid$is_popular <- ifelse(valid$is_popular == 1, 'popular', 'not_popular')
+
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              classProbs = T,
+                              verboseIter = F,
+                              summaryFunction = twoClassSummary)
+
+set.seed(20202020)
+
+xgboost_model <- train(is_popular ~ . - article_id,
+                       method = "xgbTree",
+                       data = train,
+                       trControl = train_control,
+                       tuneGrid = expand.grid(nrounds = c(500),
+                                               max_depth = c(7),
+                                               eta = c(0.01),
+                                               gamma = 0,
+                                               colsample_bytree = c(0.45),
+                                               min_child_weight = c(3), 
+                                               subsample = c(0.75)))
+```
+
+Let's see the score of the best model:
+
+```{r}
+xgboost_model$results[xgboost_model$results$eta == xgboost_model$bestTune$eta &
+                        xgboost_model$results$max_depth == xgboost_model$bestTune$max_depth &
+                        xgboost_model$results$colsample_bytree == xgboost_model$bestTune$colsample_bytree &
+                        xgboost_model$results$min_child_weight == xgboost_model$bestTune$min_child_weight &
+                        xgboost_model$results$subsample == xgboost_model$bestTune$subsample, ][1:8] # 71.47
+```
+
+Let's calculate the AUC on the validation dataset:
+
+```{r, warning = F, message = F}
+valid_predictions <- predict.train(xgboost_model, newdata = valid, type = 'prob')$popular
+actuals <- valid$is_popular
+roc_obj <- roc(actuals, valid_predictions)
+auc(roc_obj) # 72.7
+```
+
+AUC on the validation set with the `xgBoost` method is 72.7. 
+
+GBM with `h2o` scored 72.85, so `xgBoost` did not manage to beat my GBM.
+
+My stacked model's AUC on the validation was 72.74, so `xgBoost` almost beat that too! **This is when I realized I want to stack an xgBoost to a GBM and see if I can score even better, so I had to turn to Python because I use Windows and `h2o` doesn't do `xgBoost` on Windows**.
+
+To add a note: `xgBoost` beat `lightGBM` and `GradientBoostingClassifier` in Python.
+
+
+Showing how the Kaggle predictions were made:
+
+```{r, include = T, eval = F}
+# save predictions on test
+xgb_test <- data.frame(article_id = test$article_id,
+                       score = predict.train(xgboost_model, newdata = test, type = 'prob')$popular)
+write.csv(xgb_test, "KrRab_XGB.csv", row.names = F, quote = F)
+```
+
+
+### Keras Net
+
+The last thing I wanted to try in R (after tree methods in `h2o` and then a separate `xgBoost`) was a neural network built in Keras.
+
+1. I need to re-import the files and scale them but keep every feature as numeric,
+
+```{r, warning = F, message = F}
+train <- data.table(read.csv("train.csv"))
+test <- data.table(read.csv("test.csv"))
+
+to_drop <- c("n_non_stop_words", "n_non_stop_unique_tokens", "kw_avg_min")
+train[, (to_drop) := NULL]
+test[, (to_drop) := NULL]
+
+scales <- build_scales(dataSet = train, cols = X_cols, verbose = F)
+fastScale(dataSet = train, scales = scales, verbose = F)
+fastScale(dataSet = test, scales = scales, verbose = F)
+```
+
+2. I need to turn the data.tables into the necessary input shape.
+
+X and y need to be data.matrices, and y need to be `categorical` for Keras (due to the binary classification problem at hand)
+
+```{r}
+train <- data.frame(train)
+test <- data.frame(test)
+
+set.seed(20202020)
+train_index <- createDataPartition(train$is_popular, times = 1, p = 0.8, list = F)
+valid <- train[-train_index, ]
+train <- train[train_index, ]
+
+X_train <- train %>% select(-article_id, -is_popular)
+y_train <- to_categorical(train$is_popular)
+X_train <- data.matrix(X_train)
+y_train <- data.matrix(y_train)
+
+X_valid <- valid %>% select(-article_id, -is_popular)
+y_valid <- to_categorical(valid$is_popular)
+X_valid <- data.matrix(X_valid)
+y_valid <- data.matrix(y_valid)
+
+X_test <- test %>% select(-article_id)
+X_test <- data.matrix(X_test)
+```
+
+3. I can start building the Keras net model.
+
+```{r}
+model <- keras_model_sequential() 
+
+model %>% 
+  layer_dense(units = 256, activation = 'sigmoid', input_shape = ncol(X_train)) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 256, activation = 'relu') %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 128, activation = 'relu') %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 2, activation = 'sigmoid')
+
+history <- model %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = 'adam',
+  metrics = 'accuracy'
+)
+```
+
+4. Take a look at the structure:
+
+```{r}
+summary(model)
+```
+
+After trying lots of activation functions, dropout ratios, hidden layers and hidden units, it seemed like this particular structure was doing best amongst my deep learning models. I use dropout layers between all dense layers to try to generalize the net.
+
+5. Train the net.
+
+I've introduced to `callback` rules: (1) if for 3 consecutive epochs the validation loss does not decrease, I'll decrease the learning rate by a factor of 0.1 and (2) if for 10 consecutive epochs the validation loss does not decrease, I'm completely stopping the training procedure.
+
+```{r, warning = F, message = F}
+set.seed(20202020)
+
+history <- model %>% fit(X_train, y_train, 
+                         epochs = 20, 
+                         batch_size = 100,
+                         validation_data = list(X_valid, y_valid),
+                         callbacks = list(callback_early_stopping(monitor = 'val_loss', min_delta = 0.005, patience = 10),
+                                          callback_reduce_lr_on_plateau(monitor = 'val_loss', patience = 3, factor = 0.1))
+)
+```
+
+Let's see the history
+
+```{r, fig.height = 5, fig.width = 8, fig.align='center'}
+plot(history, method = 'ggplot2', smooth = T, theme_bw = T)
+```
+
+
+6. Finally calculate the AUC on the validation set
+
+```{r, warning = F, message = F}
+valid_predictions <- model %>% predict_proba(X_valid)
+actuals <- y_valid[, 2]
+valid_predictions <- valid_predictions[,2]
+roc_obj <- roc(actuals, valid_predictions)
+auc(roc_obj)
+```
+
+I've experimented with lots of structures, but deep learning simply does not sound like an answer to this prediction problem. Gradient Boosting Machine still achieves the best result.
+
+Showing how the Kaggle submission was created. (not submitted, due to worse AUC)
+
+```{r, eval = F, include = T}
+test_predictions <- model %>% predict_proba(X_test)
+test_predictions <- test_predictions[,2]
+keras_pred <- data.frame(article_id = test$article_id,
+                         score = test_predictions)
+write.csv(keras_pred, "KrRab_keras.csv", row.names = F, quote = F)
+```
+
+This concludes my Kaggle submission in R. For the Python models (`lightGBM`, `xgBoost`, etc...) please turn to the Jupyter Notebook saved as HTML with all the results and comments.
